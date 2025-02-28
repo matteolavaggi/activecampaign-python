@@ -56,7 +56,27 @@ class DeepDataIntegrations(object):
         return self.client._delete("/connections/{}".format(connection_id))
     
     def list_all_connections(self):
-        raise NotImplementedError
+        """List all deep data connections/integrations.
+        
+        Returns:
+            dict: List of all connections
+        """
+        return self.client._get("/connections")
+
+    def get_connection_by_name(self, service_name):
+        """Get a connection by service name.
+        
+        Args:
+            service_name (str): Name of the service to find
+            
+        Returns:
+            dict: Connection details if found, None otherwise
+        """
+        response = self.list_all_connections()
+        for connection in response.get('connections', []):
+            if connection['service'] == service_name:
+                return connection
+        return None
 
     def create_an_ecommerce_customer(self, data):
         """
