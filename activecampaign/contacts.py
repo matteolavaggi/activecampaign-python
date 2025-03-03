@@ -161,7 +161,16 @@ class Contacts(object):
         Returns:
 
         """
-        return self.client._post("/fields", json=data)
+        response = self.client._post("/fields", json=data)
+        
+        # If field was created successfully, add it to default group
+        if response and response.get('field', {}).get('id'):
+            field_id = response['field']['id']
+            group_response = self.add_custom_field_to_group(field_id)
+            if not group_response:
+                log.warning(f"Failed to add custom field {field_id} to group")
+        
+        return response
 
     def retrieve_a_custom_field(self, field_id):
         """
@@ -310,3 +319,20 @@ class Contacts(object):
 
         """
         return self.client._get("/fields/{}/options".format(field_id))
+
+    def add_custom_field_to_group(self, field_id: str, group_id: int = 1, ordernum: int = None) -> dict:
+        """Add custom field to a field group.
+        
+        Args:
+            field_id: The ID of the custom field
+            group_id: The group ID (default 1 for contacts)
+            ordernum: Order within group (optional)
+        """
+        data = {
+            "groupMember": {
+                "rel_id": field_id,
+                "group_id": group_id,
+                "ordernum": ordernum
+            }
+        }
+        return self.client._post("/groupMembers", json=data)
