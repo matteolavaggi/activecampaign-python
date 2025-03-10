@@ -341,39 +341,32 @@ class Contacts(object):
         }
         return self.client._post("/groupMembers", json=data)
 
-    def bulk_import_contacts(self, contacts, callback=None, exclude_automations=False):
+    def bulk_import_contacts(
+        self,
+        contacts,
+        callback=None,
+        exclude_automations=True,
+        wait_for_completion=True,
+        max_wait_time=300,
+        debug_log=None,
+    ):
         """Bulk import contacts into ActiveCampaign.
 
-        Args:
-            contacts (list): List of contact objects. Each contact object should contain:
-                - email (str): Required. Contact's email address
-                - first_name (str, optional): Contact's first name
-                - last_name (str, optional): Contact's last name
-                - phone (str, optional): Contact's phone number
-                - tags (list, optional): List of tags to apply
-                - fields (list, optional): List of field objects with 'id' and 'value'
-                - subscribe (list, optional): List of list objects with 'listid' to subscribe to
-                - unsubscribe (list, optional): List of list objects with 'listid' to unsubscribe from
-            callback (dict, optional): Callback configuration containing:
-                - url (str): Callback URL
-                - requestType (str): HTTP method for callback
-                - detailed_results (str): Whether to include detailed results
-                - params (list, optional): List of key-value param objects
-                - headers (list, optional): List of key-value header objects
-            exclude_automations (bool, optional): Whether to skip running automations on import.
-                                                Defaults to False.
-
-        Returns:
-            dict: Response from the API containing:
-                - success (int): Number of successfully imported contacts
-                - queued_contacts (int): Number of contacts queued for import
-                - batchId (str): Unique identifier for this import batch
-                - message (str): Status message
-
-        Raises:
-            ValueError: If contacts list is empty or exceeds 250 contacts
-            Exception: If the API request fails
+        This method has two phases:
+        1. POST to /import/bulk_import to queue the contacts
+        2. GET from /import/info?batchId=xxx to check status
         """
+        import json
+        import time
+
+        def log_debug(msg, data=None):
+            """Helper function for debug logging."""
+            if debug_log:
+                if data:
+                    debug_log(f"{msg}\n{json.dumps(data, indent=2)}")
+                else:
+                    debug_log(msg)
+
         if not contacts:
             raise ValueError("Contacts list cannot be empty")
 
@@ -388,16 +381,224 @@ class Contacts(object):
                 "For fewer contacts, use create_or_update_contact() instead."
             )
 
+        # PHASE 1: Queue contacts for import
+        log_debug("=== Phase 1: Queueing Contacts for Import ===")
+
         # Prepare request data
         data = {"contacts": contacts}
-
-        # Add callback if provided
         if callback:
             data["callback"] = callback
-
-        # Add automation exclusion if specified
         if exclude_automations:
             data["exclude_automations"] = True
 
-        # Make the API call
-        return self.client._post("/import/bulk_import", json=data)
+        # Queue the import
+        response = self.client._post("/import/bulk_import", json=data)
+        log_debug("Bulk import queued:", response)
+
+        if not wait_for_completion:
+            return response
+
+        # PHASE 2: Monitor import status
+        log_debug("=== Phase 2: Monitoring Import Status ===")
+
+        batch_id = response.get("batchId")
+        if not batch_id:
+            log_debug("Error: No batch ID in response:", response)
+            raise ValueError("No batch ID returned from import request")
+
+        log_debug(f"Starting status checks for batch: {batch_id}")
+        log_debug(f"Total contacts to process: {len(contacts)}")
+
+        # Add initial delay as recommended in the docs
+        time.sleep(1)
+
+        # Monitor progress
+        start_time = time.time()
+        check_count = 0
+        last_progress = -1
+
+        # Extract emails from contacts for later lookup
+        contact_emails = []
+        for contact in contacts:
+            email = contact.get("email", "").lower()
+            if email:
+                contact_emails.append(email)
+            else:
+                contact_emails.append(None)  # Placeholder for contacts without email
+
+        # Prepare result with contact IDs
+        result = {
+            "success": [],
+            "failure": [],
+            "batchId": batch_id,
+            "contact_ids": {},  # Will store email -> id mapping
+            "total_time": 0,
+            "status": "",
+        }
+
+        while True:
+            check_count += 1
+            elapsed_time = time.time() - start_time
+
+            if elapsed_time > max_wait_time:
+                raise TimeoutError(
+                    f"Import exceeded maximum wait time of {max_wait_time} seconds"
+                )
+
+            # Make status check request
+            log_debug("----------------------------------------")
+            log_debug(
+                f"Status Check #{check_count} - Elapsed time: {elapsed_time:.1f}s"
+            )
+
+            status_url = f"/import/info?batchId={batch_id}"
+            log_debug(f"Checking status at: {status_url}")
+
+            # Get status and parse the JSON response
+            raw_response = self.client._get(status_url)
+            try:
+                # If response is already a dict, use it as is
+                if isinstance(raw_response, dict):
+                    status_response = raw_response
+                # If response is a string, try to parse it as JSON
+                elif isinstance(raw_response, str):
+                    status_response = json.loads(raw_response)
+                else:
+                    log_debug(f"Unexpected response type: {type(raw_response)}")
+                    time.sleep(5)
+                    continue
+
+                log_debug("Status response:", status_response)
+            except json.JSONDecodeError as e:
+                log_debug(f"Failed to parse response as JSON: {e}")
+                log_debug("Raw response:", raw_response)
+                time.sleep(5)
+                continue
+
+            # Process status
+            status = status_response.get("status", "").lower()
+            success_list = status_response.get("success", [])
+            failure_list = status_response.get("failure", [])
+            success_count = len(success_list) if success_list else 0
+            failure_count = len(failure_list) if failure_list else 0
+
+            # Log progress changes
+            if int((success_count + failure_count) / len(contacts) * 20) > int(
+                last_progress
+            ):
+                last_progress = (success_count + failure_count) / len(contacts) * 20
+                log_debug(
+                    "Progress:",
+                    {
+                        "status": status,
+                        "processed": f"{success_count + failure_count}/{len(contacts)}",
+                        "success": success_count,
+                        "failed": failure_count,
+                    },
+                )
+
+            # Handle completion
+            if status == "completed":
+                log_debug(
+                    "✓ Import completed",
+                    {
+                        "success": success_count,
+                        "failed": failure_count,
+                        "time": f"{elapsed_time:.1f}s",
+                    },
+                )
+
+                # PHASE 3: Get contact IDs for successful imports
+                log_debug("=== Phase 3: Getting Contact IDs ===")
+
+                # We need to make individual API calls to get the contact IDs
+                # This is more reliable than assuming the order of success_list matches contacts
+                if success_count > 0:
+                    log_debug(f"Looking up IDs for {success_count} successful contacts")
+
+                    # Get the emails that were successfully imported
+                    successful_emails = []
+                    for i, email in enumerate(contact_emails):
+                        if email and i < len(contacts) and i not in failure_list:
+                            successful_emails.append(email)
+
+                    # Look up each email individually to get its ID
+                    for email in successful_emails:
+                        try:
+                            # Make API call to get contact by email
+                            log_debug(f"Looking up contact ID for email: {email}")
+                            log_debug(f"API call: GET /contacts?email={email}")
+
+                            # Use the direct method to find contact by email
+                            contact = self.find_contact_by_email(email)
+                            log_debug(f"Contact found: {contact is not None}")
+
+                            if contact:
+                                contact_id = contact["id"]
+                                log_debug(f"Contact details: {contact}")
+
+                                # Verify this is the correct contact by checking the email
+                                contact_email = contact.get("email", "").lower()
+                                if contact_email != email.lower():
+                                    log_debug(
+                                        f"Email mismatch! Requested: {email}, Found: {contact_email}"
+                                    )
+                                else:
+                                    result["contact_ids"][email] = contact_id
+                                    log_debug(
+                                        f"Found ID {contact_id} for email {email}"
+                                    )
+                            else:
+                                log_debug(f"No contact found for email {email}")
+                        except Exception as e:
+                            log_debug(
+                                f"Error looking up contact ID for {email}: {str(e)}"
+                            )
+                            log_debug(f"Exception details: {str(e)}")
+
+                result["success"] = success_list
+                result["failure"] = failure_list
+                result["total_time"] = elapsed_time
+                result["status"] = status
+                return result
+
+            elif status in ["failed", "interrupted"]:
+                log_debug("✗ Import failed", status_response)
+                result["success"] = success_list
+                result["failure"] = failure_list
+                result["total_time"] = elapsed_time
+                result["status"] = status
+                result["error"] = status_response.get("error")
+                return result
+
+            elif status in ["waiting", "claimed", "active"]:
+                log_debug(f"Status: {status}")
+                time.sleep(5)
+                continue
+            else:
+                log_debug(f"Unknown status: {status}")
+                time.sleep(5)
+                continue
+
+    def find_contact_by_email(self, email):
+        """Find a contact by email address.
+
+        This method makes a direct API call to search for a contact by email.
+
+        Args:
+            email (str): The email address to search for
+
+        Returns:
+            dict: The contact data if found, None otherwise
+        """
+        if not email:
+            return None
+
+        # Make a direct API call to search for the contact
+        endpoint = f"/contacts?email={email}"
+        response = self.client._get(endpoint)
+
+        if response and response.get("contacts") and len(response["contacts"]) > 0:
+            return response["contacts"][0]
+
+        return None
