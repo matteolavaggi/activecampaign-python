@@ -170,7 +170,7 @@ class Contacts(object):
             field_id = response["field"]["id"]
             group_response = self.add_custom_field_to_group(field_id)
             if not group_response:
-                log.warning(f"Failed to add custom field {field_id} to group")
+                print(f"Warning: Failed to add custom field {field_id} to group")
 
         return response
 
@@ -349,12 +349,16 @@ class Contacts(object):
         wait_for_completion=True,
         max_wait_time=300,
         debug_log=None,
+        db_tracker=None,
     ):
         """Bulk import contacts into ActiveCampaign.
 
         This method has two phases:
         1. POST to /import/bulk_import to queue the contacts
         2. GET from /import/info?batchId=xxx to check status
+
+        If db_tracker is provided, it will also update contact IDs in the database
+        after a successful import.
         """
         import json
         import time
@@ -363,7 +367,17 @@ class Contacts(object):
             """Helper function for debug logging."""
             if debug_log:
                 if data:
-                    debug_log(f"{msg}\n{json.dumps(data, indent=2)}")
+                    if isinstance(data, dict) or isinstance(data, list):
+                        # Use a separate debug logger for raw API responses
+                        from src.logger import log_debug_item
+
+                        try:
+                            log_debug_item(f"{msg}\n{json.dumps(data, indent=2)}")
+                        except:
+                            # Fallback to regular debug log if log_debug_item is not available
+                            debug_log(f"{msg}\n{json.dumps(data, indent=2)}")
+                    else:
+                        debug_log(f"{msg} {data}")
                 else:
                     debug_log(msg)
 
@@ -513,6 +527,123 @@ class Contacts(object):
                 result["failure"] = failure_list
                 result["total_time"] = elapsed_time
                 result["status"] = status
+
+                # PHASE 3: Update contact IDs in database if we have a database tracker
+                if (
+                    status == "completed"
+                    and db_tracker
+                    and hasattr(db_tracker, "execute")
+                ):
+                    log_debug("=== Phase 3: Updating Contact IDs in Database ===")
+
+                    # Extract emails from successful contacts
+                    successful_emails = []
+                    email_map = {}  # Map to track email -> original case
+                    for contact in contacts:
+                        email = contact.get("email", "").lower()
+                        if email and email not in failure_list:
+                            successful_emails.append(email)
+                            email_map[email.lower()] = contact.get("email", "")
+
+                    if successful_emails:
+                        log_debug(f"Updating IDs for {len(successful_emails)} contacts")
+
+                        # Get list IDs from the contacts
+                        list_ids = set()
+                        for contact in contacts:
+                            if contact.get("subscribe"):
+                                if isinstance(contact["subscribe"], list):
+                                    for list_item in contact["subscribe"]:
+                                        if isinstance(
+                                            list_item, dict
+                                        ) and list_item.get("listid"):
+                                            list_ids.add(list_item["listid"])
+                                        elif isinstance(list_item, (str, int)):
+                                            list_ids.add(str(list_item))
+                                elif isinstance(contact["subscribe"], dict) and contact[
+                                    "subscribe"
+                                ].get("listid"):
+                                    list_ids.add(contact["subscribe"]["listid"])
+                                elif isinstance(contact["subscribe"], (str, int)):
+                                    list_ids.add(str(contact["subscribe"]))
+
+                        # If we couldn't extract list IDs from contacts, we can't update IDs
+                        if not list_ids:
+                            log_debug(
+                                "No list IDs found in contacts, skipping ID update"
+                            )
+                        else:
+                            log_debug(
+                                f"Found {len(list_ids)} list IDs to query: {list_ids}"
+                            )
+
+                            # Create a dictionary to store contact IDs by email
+                            contact_ids = {}
+
+                            # Query each list for contacts
+                            for list_id in list_ids:
+                                log_debug(f"Querying contacts from list ID: {list_id}")
+
+                                # Get all contacts from this list with pagination
+                                list_contacts = self.get_contacts_by_list(
+                                    list_id, limit=100, debug_log=debug_log
+                                )
+                                log_debug(
+                                    f"Found {len(list_contacts)} contacts in list {list_id}"
+                                )
+
+                                # Process contacts from this list
+                                for contact in list_contacts:
+                                    if contact.get("email") and contact.get("id"):
+                                        contact_email = contact["email"].lower()
+                                        contact_ids[contact_email] = contact["id"]
+
+                            log_debug(
+                                f"Total unique contacts found across all lists: {len(contact_ids)}"
+                            )
+
+                            # Update database with contact IDs
+                            updated_count = 0
+                            not_found_count = 0
+                            error_count = 0
+
+                            for email in successful_emails:
+                                email_lower = email.lower()
+                                if email_lower in contact_ids:
+                                    contact_id = contact_ids[email_lower]
+                                    original_email = email_map.get(email_lower, email)
+
+                                    try:
+                                        db_tracker.execute(
+                                            """
+                                            UPDATE Contacts SET 
+                                                ac_contact_id = ?
+                                            WHERE Email = ?
+                                            """,
+                                            (contact_id, original_email),
+                                        )
+                                        updated_count += 1
+                                        log_debug(
+                                            f"Updated contact ID for {original_email}: {contact_id}"
+                                        )
+                                    except Exception as e:
+                                        error_count += 1
+                                        log_debug(
+                                            f"Error updating contact ID for {original_email}: {str(e)}"
+                                        )
+                                else:
+                                    not_found_count += 1
+
+                            # Add stats to result
+                            update_stats = {
+                                "total": len(successful_emails),
+                                "updated": updated_count,
+                                "not_found": not_found_count,
+                                "errors": error_count,
+                            }
+                            log_debug(f"Contact ID update stats: {update_stats}")
+                            result["id_update_stats"] = update_stats
+
                 return result
 
             elif status in ["failed", "interrupted"]:
@@ -533,13 +664,14 @@ class Contacts(object):
                 time.sleep(5)
                 continue
 
-    def find_contact_by_email(self, email):
+    def find_contact_by_email(self, email, debug_log=None):
         """Find a contact by email address.
 
         This method makes a direct API call to search for a contact by email.
 
         Args:
             email (str): The email address to search for
+            debug_log (callable, optional): Function to log debug messages
 
         Returns:
             dict: The contact data if found, None otherwise
@@ -547,11 +679,240 @@ class Contacts(object):
         if not email:
             return None
 
+        def log_debug(msg, data=None):
+            if debug_log:
+                if data:
+                    import json
+
+                    if isinstance(data, dict) or isinstance(data, list):
+                        # Try to use debug logger for raw API responses
+                        try:
+                            from src.logger import log_debug_item
+
+                            log_debug_item(f"{msg}\n{json.dumps(data, indent=2)}")
+                        except:
+                            # Fallback to regular debug log
+                            debug_log(f"{msg}\n{json.dumps(data, indent=2)}")
+                    else:
+                        debug_log(f"{msg} {data}")
+                else:
+                    debug_log(msg)
+
         # Make a direct API call to search for the contact
         endpoint = f"/contacts?email={email}"
+        log_debug(f"Searching for contact with email: {email}", f"GET {endpoint}")
+
         response = self.client._get(endpoint)
 
-        if response and response.get("contacts") and len(response["contacts"]) > 0:
-            return response["contacts"][0]
+        # Log the raw response for debugging
+        log_debug("Raw API response:", response)
 
+        if response and response.get("contacts") and len(response["contacts"]) > 0:
+            contact = response["contacts"][0]
+            log_debug(f"Found contact with ID: {contact.get('id')}")
+            return contact
+
+        log_debug(f"No contact found with email: {email}")
         return None
+
+    def get_contacts_by_list(
+        self, list_id, limit=100, max_contacts=None, debug_log=None
+    ):
+        """Get all contacts from a specific list with pagination support.
+
+        This method handles pagination automatically and returns all contacts
+        from the specified list.
+
+        Args:
+            list_id (int): The ID of the list to get contacts from
+            limit (int): Number of contacts to retrieve per page (max 100)
+            max_contacts (int, optional): Maximum number of contacts to retrieve,
+                                         None for all contacts
+            debug_log (callable, optional): Function to log debug messages
+
+        Returns:
+            list: List of contact dictionaries
+        """
+        if not list_id:
+            return []
+
+        def log_debug(msg, data=None):
+            if debug_log:
+                if data:
+                    import json
+
+                    if isinstance(data, dict) or isinstance(data, list):
+                        # Try to use debug logger for raw API responses
+                        try:
+                            from src.logger import log_debug_item
+
+                            log_debug_item(f"{msg}\n{json.dumps(data, indent=2)}")
+                        except:
+                            # Fallback to regular debug log
+                            debug_log(f"{msg}\n{json.dumps(data, indent=2)}")
+                    else:
+                        debug_log(f"{msg} {data}")
+                else:
+                    debug_log(msg)
+
+        all_contacts = []
+        offset = 0
+        more_contacts = True
+        page_count = 0
+
+        log_debug(f"Starting to fetch contacts from list ID: {list_id}")
+
+        while more_contacts:
+            page_count += 1
+            # Use id_greater parameter for better performance as recommended in the docs
+            params = {"listid": list_id, "limit": limit, "orders[id]": "ASC"}
+
+            # If we have contacts already, use id_greater for better performance
+            if all_contacts and all_contacts[-1].get("id"):
+                params["id_greater"] = all_contacts[-1]["id"]
+                log_debug(f"Page {page_count}: Using id_greater={params['id_greater']}")
+            else:
+                params["offset"] = offset
+                log_debug(f"Page {page_count}: Using offset={offset}")
+
+            log_debug(f"Fetching contacts with params:", params)
+            response = self.client._get("/contacts", params=params)
+
+            if not response:
+                log_debug("No response received from API")
+                more_contacts = False
+                continue
+
+            log_debug(f"Raw API response for page {page_count}:", response)
+
+            if not response.get("contacts"):
+                log_debug("No contacts found in response")
+                more_contacts = False
+                continue
+
+            contacts_page = response["contacts"]
+            if not contacts_page:
+                log_debug("Empty contacts list in response")
+                more_contacts = False
+                continue
+
+            log_debug(f"Found {len(contacts_page)} contacts on page {page_count}")
+            all_contacts.extend(contacts_page)
+
+            # Check if we've reached the maximum number of contacts
+            if max_contacts and len(all_contacts) >= max_contacts:
+                log_debug(f"Reached maximum contacts limit: {max_contacts}")
+                all_contacts = all_contacts[:max_contacts]
+                more_contacts = False
+
+            # Update offset for next page
+            offset += limit
+
+            # Check if we've reached the end of the contacts
+            if len(contacts_page) < limit:
+                log_debug(
+                    f"Received fewer contacts ({len(contacts_page)}) than limit ({limit}), ending pagination"
+                )
+                more_contacts = False
+
+        log_debug(f"Total contacts fetched from list {list_id}: {len(all_contacts)}")
+        return all_contacts
+
+    def update_contact_ids_in_database(
+        self, emails_to_update, db_tracker, debug_log=None
+    ):
+        """Update contact IDs in the database for a list of emails.
+
+        This method takes a list of emails, looks up their contact IDs in ActiveCampaign,
+        and updates the database with the IDs.
+
+        Args:
+            emails_to_update (list): List of email addresses to update
+            db_tracker: Database tracker object with execute method
+            debug_log (callable, optional): Function to log debug messages
+
+        Returns:
+            dict: Statistics about the update process
+        """
+        if not emails_to_update or not db_tracker:
+            return {"total": 0, "updated": 0, "not_found": 0, "errors": 0}
+
+        def log_debug(msg, data=None):
+            if debug_log:
+                if data:
+                    import json
+
+                    if isinstance(data, dict) or isinstance(data, list):
+                        # Try to use debug logger for raw API responses
+                        try:
+                            from src.logger import log_debug_item
+
+                            log_debug_item(f"{msg}\n{json.dumps(data, indent=2)}")
+                        except:
+                            # Fallback to regular debug log
+                            debug_log(f"{msg}\n{json.dumps(data, indent=2)}")
+                    else:
+                        debug_log(f"{msg} {data}")
+                else:
+                    debug_log(msg)
+
+        stats = {
+            "total": len(emails_to_update),
+            "updated": 0,
+            "not_found": 0,
+            "errors": 0,
+        }
+
+        # Process emails in chunks to avoid too many API calls at once
+        chunk_size = 100
+        email_chunks = [
+            emails_to_update[i : i + chunk_size]
+            for i in range(0, len(emails_to_update), chunk_size)
+        ]
+
+        for chunk in email_chunks:
+            # Create a mapping of lowercase emails for case-insensitive matching
+            email_map = {email.lower(): email for email in chunk if email}
+
+            if not email_map:
+                continue
+
+            log_debug(f"Processing chunk of {len(email_map)} emails")
+
+            # Process each email individually for more reliable results
+            for email in email_map.values():
+                try:
+                    log_debug(f"Looking up contact ID for email: {email}")
+
+                    # Use the find_contact_by_email method which is more reliable
+                    contact = self.find_contact_by_email(email, debug_log=debug_log)
+
+                    if contact and contact.get("id"):
+                        contact_id = contact["id"]
+                        log_debug(f"Found contact ID: {contact_id} for email: {email}")
+
+                        try:
+                            db_tracker.execute(
+                                """
+                                UPDATE Contacts SET 
+                                    ac_contact_id = ?
+                                WHERE Email = ?
+                                """,
+                                (contact_id, email),
+                            )
+                            stats["updated"] += 1
+                            log_debug(f"Updated contact ID for {email}: {contact_id}")
+                        except Exception as e:
+                            stats["errors"] += 1
+                            log_debug(
+                                f"Error updating contact ID for {email}: {str(e)}"
+                            )
+                    else:
+                        stats["not_found"] += 1
+                        log_debug(f"No contact found for email: {email}")
+
+                except Exception as e:
+                    stats["errors"] += 1
+                    log_debug(f"Error processing email {email}: {str(e)}")
+
+        return stats
