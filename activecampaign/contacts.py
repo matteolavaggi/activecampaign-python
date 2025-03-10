@@ -508,54 +508,7 @@ class Contacts(object):
                     },
                 )
 
-                # PHASE 3: Get contact IDs for successful imports
-                log_debug("=== Phase 3: Getting Contact IDs ===")
-
-                # We need to make individual API calls to get the contact IDs
-                # This is more reliable than assuming the order of success_list matches contacts
-                if success_count > 0:
-                    log_debug(f"Looking up IDs for {success_count} successful contacts")
-
-                    # Get the emails that were successfully imported
-                    successful_emails = []
-                    for i, email in enumerate(contact_emails):
-                        if email and i < len(contacts) and i not in failure_list:
-                            successful_emails.append(email)
-
-                    # Look up each email individually to get its ID
-                    for email in successful_emails:
-                        try:
-                            # Make API call to get contact by email
-                            log_debug(f"Looking up contact ID for email: {email}")
-                            log_debug(f"API call: GET /contacts?email={email}")
-
-                            # Use the direct method to find contact by email
-                            contact = self.find_contact_by_email(email)
-                            log_debug(f"Contact found: {contact is not None}")
-
-                            if contact:
-                                contact_id = contact["id"]
-                                log_debug(f"Contact details: {contact}")
-
-                                # Verify this is the correct contact by checking the email
-                                contact_email = contact.get("email", "").lower()
-                                if contact_email != email.lower():
-                                    log_debug(
-                                        f"Email mismatch! Requested: {email}, Found: {contact_email}"
-                                    )
-                                else:
-                                    result["contact_ids"][email] = contact_id
-                                    log_debug(
-                                        f"Found ID {contact_id} for email {email}"
-                                    )
-                            else:
-                                log_debug(f"No contact found for email {email}")
-                        except Exception as e:
-                            log_debug(
-                                f"Error looking up contact ID for {email}: {str(e)}"
-                            )
-                            log_debug(f"Exception details: {str(e)}")
-
+                # Return the results without looking up contact IDs
                 result["success"] = success_list
                 result["failure"] = failure_list
                 result["total_time"] = elapsed_time
